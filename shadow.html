@@ -1,0 +1,91 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MToonNodeMaterial: shadows darken instead of shading</title>
+<style>body { margin: 0; background: #222; color: #ddd; font: 13px system-ui; } canvas { margin: 8px; } #out { margin: 8px; white-space: pre; }</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.186.0/build/three.module.js",
+  "three/webgpu": "https://unpkg.com/three@0.186.0/build/three.webgpu.js",
+  "three/tsl": "https://unpkg.com/three@0.186.0/build/three.tsl.js",
+  "three/addons/": "https://unpkg.com/three@0.186.0/examples/jsm/",
+  "@pixiv/three-vrm": "https://unpkg.com/@pixiv/three-vrm@3.5.5/lib/three-vrm.module.js",
+  "@pixiv/three-vrm/nodes": "https://unpkg.com/@pixiv/three-vrm@3.5.5/lib/nodes/index.module.js"
+} }
+</script>
+</head>
+<body>
+<div>Left: <code>MToonMaterial</code> on <code>WebGLRenderer</code>. Right: <code>MToonNodeMaterial</code> on <code>WebGPURenderer</code>. <code>?light=directional|spot|point</code></div>
+<canvas id="gl" width="512" height="512"></canvas><canvas id="gpu" width="512" height="512"></canvas>
+<div id="out"></div>
+<script type="module">
+// A sphere with a light lit colour and a distinct shade colour, partly shadowed by a box and by itself, under one
+// shadow-casting light. MToonMaterial (GLSL) shades the shadowed part with the shade colour under the full light;
+// MToonNodeMaterial (three-vrm 3.5.5 and dev) leaves the shadow in the light colour, so that part goes dark.
+import * as THREE from 'three';
+import * as WEBGPU from 'three/webgpu';
+import { MToonMaterial } from '@pixiv/three-vrm';
+import { MToonNodeMaterial } from '@pixiv/three-vrm/nodes';
+
+const q = new URLSearchParams(location.search), kind = q.get('light') ?? 'directional', SIZE = 512;
+const params = {
+  color: new THREE.Color(1.0, 0.85, 0.75), shadeColorFactor: new THREE.Color(0.55, 0.25, 0.35),
+  shadingToonyFactor: 0.9, shadingShiftFactor: 0.0,
+};
+
+function scene(T, Material) {
+  const s = new T.Scene();
+  s.background = new T.Color(0.15, 0.15, 0.18);
+  s.add(new T.AmbientLight(0xffffff, 0.15));
+  const light = kind === 'spot' ? new T.SpotLight(0xffffff, 40, 0, Math.PI / 6, 0.2, 2) : kind === 'point' ? new T.PointLight(0xffffff, 40, 0, 2) : new T.DirectionalLight(0xffffff, 2.5);
+  light.position.set(2, 3, 2.5);
+  light.castShadow = true;
+  light.shadow.mapSize.set(1024, 1024);
+  light.shadow.bias = -0.0005;
+  if (light.isDirectionalLight) Object.assign(light.shadow.camera, { left: -2, right: 2, top: 2, bottom: -2, near: 0.5, far: 10 });
+  else { light.shadow.camera.near = 0.5; light.shadow.camera.far = 10; }
+  s.add(light);
+  if (light.target) { light.target.position.set(0, 0, 0); s.add(light.target); }
+  const sphere = new T.Mesh(new T.SphereGeometry(1, 64, 32), new Material(params));
+  sphere.castShadow = true; sphere.receiveShadow = true;
+  s.add(sphere);
+  const box = new T.Mesh(new T.BoxGeometry(0.5, 0.5, 0.5), new T.MeshStandardMaterial({ color: 0x8899aa }));
+  box.position.set(0.9, 1.45, 1.15);
+  box.castShadow = true;
+  s.add(box);
+  const camera = new T.PerspectiveCamera(40, 1, 0.1, 50);
+  camera.position.set(0, 0.3, 4.2); camera.lookAt(0, 0, 0);
+  return { s, camera };
+}
+
+const gl = new THREE.WebGLRenderer({ canvas: document.getElementById('gl'), antialias: false, preserveDrawingBuffer: true });
+gl.setPixelRatio(1); gl.setSize(SIZE, SIZE, false); gl.shadowMap.enabled = true; gl.shadowMap.type = THREE.PCFShadowMap;
+gl.outputColorSpace = THREE.SRGBColorSpace;
+const A = scene(THREE, MToonMaterial);
+gl.render(A.s, A.camera);
+const glURL = gl.domElement.toDataURL('image/png');
+
+const gpu = new WEBGPU.WebGPURenderer({ canvas: document.getElementById('gpu'), antialias: false });
+await gpu.init();
+gpu.setPixelRatio(1); gpu.setSize(SIZE, SIZE, false); gpu.shadowMap.enabled = true; gpu.shadowMap.type = THREE.PCFShadowMap;
+const B = scene(WEBGPU, MToonNodeMaterial);
+gpu.render(B.s, B.camera);
+const gpuURL = gpu.domElement.toDataURL('image/png'); // in the task that drew it
+
+// Compare the two frames: pixels that differ from the background in either are the sphere's and the box's
+const pixels = async (url) => { const i = new Image(); i.src = url; await i.decode(); const c = new OffscreenCanvas(SIZE, SIZE), g = c.getContext('2d'); g.drawImage(i, 0, 0); return g.getImageData(0, 0, SIZE, SIZE).data; };
+const a = await pixels(glURL), b = await pixels(gpuURL), bg = [a[0], a[1], a[2]];
+let n = 0, sum = 0, over8 = 0, max = 0;
+for (let i = 0; i < a.length; i += 4) {
+  const isBg = (d) => Math.abs(d[i] - bg[0]) + Math.abs(d[i + 1] - bg[1]) + Math.abs(d[i + 2] - bg[2]) < 3;
+  if (isBg(a) && isBg(b)) continue;
+  const m = Math.max(Math.abs(a[i] - b[i]), Math.abs(a[i + 1] - b[i + 1]), Math.abs(a[i + 2] - b[i + 2]));
+  n++; sum += m; if (m > 8) over8++; if (m > max) max = m;
+}
+const result = { light: kind, backend: gpu.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL2', objectPixels: n, meanMaxChannel: +(sum / n).toFixed(2), over8: +(over8 / n).toFixed(4), max, three: THREE.REVISION };
+document.getElementById('out').textContent = JSON.stringify(result, null, 1);
+window.__result = { ...result, glURL, gpuURL };
+</script>
+</body>
+</html>
